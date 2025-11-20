@@ -7,20 +7,41 @@ const getAI = () => {
 }
 
 /**
- * Decodes base64 audio string to AudioBuffer
+ * Helper: Decodes base64 string to Uint8Array
  */
-const decodeAudioData = async (
-  base64Data: string,
-  ctx: AudioContext
-): Promise<AudioBuffer> => {
-  const binaryString = atob(base64Data);
+const decodeBase64 = (base64: string): Uint8Array => {
+  const binaryString = atob(base64);
   const len = binaryString.length;
   const bytes = new Uint8Array(len);
   for (let i = 0; i < len; i++) {
     bytes[i] = binaryString.charCodeAt(i);
   }
-  // decodeAudioData requires array buffer
-  return await ctx.decodeAudioData(bytes.buffer);
+  return bytes;
+};
+
+/**
+ * Helper: Converts Raw PCM (Int16) data to AudioBuffer
+ * Gemini returns raw PCM data (16-bit signed integer), not a WAV/MP3 file.
+ * We must manually convert this to Float32 for the Web Audio API.
+ */
+const pcmToAudioBuffer = (
+  data: Uint8Array,
+  ctx: AudioContext,
+  sampleRate: number = 24000,
+  numChannels: number = 1
+): AudioBuffer => {
+  const dataInt16 = new Int16Array(data.buffer);
+  const frameCount = dataInt16.length / numChannels;
+  const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+
+  for (let channel = 0; channel < numChannels; channel++) {
+    const channelData = buffer.getChannelData(channel);
+    for (let i = 0; i < frameCount; i++) {
+      // Convert Int16 (-32768 to 32767) to Float32 (-1.0 to 1.0)
+      channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
+    }
+  }
+  return buffer;
 };
 
 /**
@@ -29,9 +50,8 @@ const decodeAudioData = async (
 export const generateSpeech = async (text: string): Promise<AudioBuffer> => {
   const ai = getAI();
   
-  // Truncate if too long for a single request to avoid errors, though models handle large context.
-  // For a real app, chunking logic would be here.
-  const safeText = text.substring(0, 4000); 
+  // Truncate text to avoid timeouts or token limits for a single generation request
+  const safeText = text.substring(0, 2000); 
 
   const response = await ai.models.generateContent({
     model: "gemini-2.5-flash-preview-tts",
@@ -52,10 +72,18 @@ export const generateSpeech = async (text: string): Promise<AudioBuffer> => {
     throw new Error("No audio data returned from Gemini");
   }
 
-  // Use a temporary context to decode, the player will use its own context/node
+  // Decode base64 to raw binary
+  const pcmData = decodeBase64(base64Audio);
+
+  // Use a temporary context to create the buffer. 
+  // The sample rate here (24000) MUST match the model's output.
   const tempCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
-  const buffer = await decodeAudioData(base64Audio, tempCtx);
-  tempCtx.close();
+  const buffer = pcmToAudioBuffer(pcmData, tempCtx, 24000);
+  
+  // We don't need to keep tempCtx open, we just needed its factory method
+  if (tempCtx.state !== 'closed') {
+      tempCtx.close().catch(() => {}); 
+  }
   
   return buffer;
 };

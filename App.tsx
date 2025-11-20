@@ -32,8 +32,7 @@ const App: React.FC = () => {
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const audioBufferRef = useRef<AudioBuffer | null>(null);
-  const audioStartTimeRef = useRef<number>(0);
-  const audioPauseTimeRef = useRef<number>(0); // For pausing web audio
+  // Removed unused time refs for simplicity in this version
 
   // --- Initialization ---
   useEffect(() => {
@@ -141,7 +140,7 @@ const App: React.FC = () => {
       setReaderMode(ReaderMode.IDLE);
     };
     utterance.onerror = (e) => {
-      console.error("TTS Error", e);
+      console.error("Native TTS Error", e);
       setIsPlaying(false);
     };
     utteranceRef.current = utterance;
@@ -229,20 +228,34 @@ const App: React.FC = () => {
   };
 
   const handleGeminiTTS = async () => {
-    if (!textContent) return;
+    if (!textContent) {
+      setError("No text content to read.");
+      return;
+    }
+    
+    console.log("Starting Gemini TTS Generation...");
     setIsLoading(true);
     stopAllAudio(); // Stop native
     
     try {
+      // Step 1: Generate Audio Buffer (Async operation)
       const buffer = await generateSpeech(textContent);
+      console.log("Gemini TTS Audio Generated successfully.");
+      
+      // Step 2: Set state ready to play
       audioBufferRef.current = buffer;
       setReaderMode(ReaderMode.GEMINI_TTS);
+      
+      // Step 3: Start playing immediately
       playAudioBuffer(buffer);
       setIsPlaying(true);
-    } catch (err) {
-      setError("Failed to generate AI speech.");
-      console.error(err);
-      // Fallback to native
+
+    } catch (err: any) {
+      setError(`Failed to generate AI speech: ${err.message}`);
+      console.error("Gemini TTS Error:", err);
+      // Fallback to native if AI fails
+      console.log("Falling back to native TTS");
+      setReaderMode(ReaderMode.IDLE);
       prepareNativeTTS(textContent);
     } finally {
       setIsLoading(false);
@@ -250,8 +263,12 @@ const App: React.FC = () => {
   };
 
   const playAudioBuffer = (buffer: AudioBuffer) => {
+    // Ensure context exists and is running
     if (!audioContextRef.current) {
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+    }
+    if (audioContextRef.current.state === 'suspended') {
+      audioContextRef.current.resume();
     }
     
     const source = audioContextRef.current.createBufferSource();
@@ -260,8 +277,6 @@ const App: React.FC = () => {
     source.connect(audioContextRef.current.destination);
     
     source.onended = () => {
-      // Only set playing false if it finished naturally, not just stopped manually
-      // But for simplicity in this demo, we reset.
       setIsPlaying(false); 
       audioSourceRef.current = null;
     };
