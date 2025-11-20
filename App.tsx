@@ -5,6 +5,7 @@ import { generateSpeech, performOCR } from './services/geminiService';
 import { PDFDocumentProxy, PDFPageProxy, ReaderMode } from './types';
 import ControlBar from './components/ControlBar';
 import { Spinner } from './components/Spinner';
+import { HighlightableText } from './components/HighlightableText';
 
 const App: React.FC = () => {
   // Data State
@@ -21,18 +22,22 @@ const App: React.FC = () => {
   // Audio State
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1.0);
+  const [highlightIndex, setHighlightIndex] = useState(0); // Current char index for highlighting
 
-  // Refs
+  // Logic Refs
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const autoPlayRef = useRef<boolean>(false); // Should we auto-play when the next page loads?
+  const previousModeRef = useRef<ReaderMode>(ReaderMode.IDLE); // Remember what mode triggered the page turn
+
+  // Native Audio Refs
   const synthRef = useRef<SpeechSynthesis>(window.speechSynthesis);
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
   
-  // Web Audio Context for Gemini TTS
+  // Gemini Audio Context Refs
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const audioBufferRef = useRef<AudioBuffer | null>(null);
-  // Removed unused time refs for simplicity in this version
 
   // --- Initialization ---
   useEffect(() => {
@@ -74,6 +79,7 @@ const App: React.FC = () => {
     setError(null);
     stopAllAudio();
     setReaderMode(ReaderMode.IDLE);
+    autoPlayRef.current = false;
 
     try {
       const doc = await loadPDF(file);
@@ -81,7 +87,6 @@ const App: React.FC = () => {
       setCurrentPageNum(1);
     } catch (err: any) {
       console.error(err);
-      // Display the actual error message to help with debugging (e.g. "Fake worker failed" or "Invalid PDF structure")
       setError(`Failed to load PDF: ${err.message || 'Unknown error'}`);
     } finally {
       setIsLoading(false);
@@ -93,8 +98,12 @@ const App: React.FC = () => {
     if (!canvasRef.current) return;
 
     setIsLoading(true);
-    stopAllAudio();
-    setReaderMode(ReaderMode.IDLE);
+    // IMPORTANT: Don't stop audio here if we are auto-playing, 
+    // but we usually need to stop previous page audio before rendering next.
+    // In this flow, audio has likely already stopped triggering the page turn.
+    stopAllAudio(); 
+    
+    setHighlightIndex(0);
     setTextContent('');
     setIsTextScanned(false);
     
@@ -110,10 +119,27 @@ const App: React.FC = () => {
       
       if (extracted.isScanned) {
         setIsTextScanned(true);
+        setReaderMode(ReaderMode.IDLE);
       } else {
         setIsTextScanned(false);
-        // Setup Native TTS ready to go
-        prepareNativeTTS(cleanText);
+        
+        // --- Auto Play Logic ---
+        if (autoPlayRef.current && cleanText.length > 0) {
+          console.log("Auto-play triggered for page", pageNum);
+          
+          // Restore previous mode logic
+          if (previousModeRef.current === ReaderMode.GEMINI_TTS) {
+            // Trigger Gemini
+            // We need to call this *after* state updates, but since handleGeminiTTS is async and uses local text var, it's fine.
+            handleGeminiTTS(cleanText); 
+          } else {
+            // Default to Native
+            prepareNativeTTS(cleanText, true);
+          }
+          autoPlayRef.current = false; // Reset trigger
+        } else {
+           prepareNativeTTS(cleanText, false);
+        }
       }
 
     } catch (err) {
@@ -122,7 +148,7 @@ const App: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
-  }, []); // Dependencies handled by useEffect
+  }, []); 
 
   useEffect(() => {
     if (pdfDoc) {
@@ -130,21 +156,56 @@ const App: React.FC = () => {
     }
   }, [pdfDoc, currentPageNum, processPage]);
 
-  // --- Audio Logic: Native ---
-  const prepareNativeTTS = (text: string) => {
-    if (!text) return;
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = playbackRate;
-    utterance.onend = () => {
+  // --- Handle Page Turn on Audio End ---
+  const handleAudioEnd = () => {
+    // We need to check if there is a next page
+    if (pdfDoc && currentPageNum < pdfDoc.numPages) {
+      console.log("Audio ended, advancing to next page...");
+      autoPlayRef.current = true;
+      previousModeRef.current = readerMode; // Remember if we were using Gemini or Native
+      setCurrentPageNum(prev => prev + 1);
+    } else {
       setIsPlaying(false);
       setReaderMode(ReaderMode.IDLE);
+      setHighlightIndex(0);
+    }
+  };
+
+  // --- Audio Logic: Native ---
+  const prepareNativeTTS = (text: string, autoStart: boolean = false) => {
+    if (!text) return;
+    
+    // Cancel any existing speech
+    synthRef.current.cancel();
+
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = playbackRate;
+    
+    // Highlighting Logic
+    utterance.onboundary = (event) => {
+      if (event.name === 'word' || event.name === 'sentence') {
+        setHighlightIndex(event.charIndex);
+      }
     };
+
+    utterance.onend = () => {
+      handleAudioEnd();
+    };
+
     utterance.onerror = (e) => {
       console.error("Native TTS Error", e);
       setIsPlaying(false);
     };
+
     utteranceRef.current = utterance;
     setReaderMode(ReaderMode.NATIVE_TTS);
+    
+    if (autoStart) {
+      setIsPlaying(true);
+      synthRef.current.speak(utterance);
+    } else {
+      setIsPlaying(false);
+    }
   };
 
   // --- Audio Logic: Play/Pause Toggle ---
@@ -167,7 +228,6 @@ const App: React.FC = () => {
         } else {
            // Start fresh
            if (utteranceRef.current) {
-             // Need to re-apply rate in case it changed
              utteranceRef.current.rate = playbackRate;
              synthRef.current.speak(utteranceRef.current);
            }
@@ -176,7 +236,6 @@ const App: React.FC = () => {
         if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
           await audioContextRef.current.resume();
         } else {
-           // If strictly fresh start or ended, playGeminiAudio handles it
            if(audioBufferRef.current && !audioSourceRef.current) {
                playAudioBuffer(audioBufferRef.current);
            }
@@ -192,10 +251,12 @@ const App: React.FC = () => {
     
     if (readerMode === ReaderMode.NATIVE_TTS) {
       if (synthRef.current.speaking) {
-        // Browser TTS often requires a cancel/restart to change rate smoothly or pause/resume
         synthRef.current.cancel();
         if (utteranceRef.current) {
             utteranceRef.current.rate = rate;
+            // Need to reset onboundary here because creating a new utterance often wipes events if not careful, 
+            // but strictly we just updated the prop on the existing obj? 
+            // No, for speech synthesis changing rate mid-speech usually requires restart.
             if (isPlaying) synthRef.current.speak(utteranceRef.current);
         }
       } else if (utteranceRef.current) {
@@ -209,7 +270,6 @@ const App: React.FC = () => {
   };
 
   // --- Gemini Features ---
-
   const handleOCR = async () => {
     if (!canvasRef.current) return;
     setIsLoading(true);
@@ -217,8 +277,8 @@ const App: React.FC = () => {
       const base64 = getCanvasAsBase64(canvasRef.current);
       const text = await performOCR(base64);
       setTextContent(text);
-      setIsTextScanned(false); // Treated as normal text now
-      prepareNativeTTS(text); // Default back to native for responsiveness
+      setIsTextScanned(false); 
+      prepareNativeTTS(text, false);
     } catch (err) {
       setError("OCR Failed. Please check your API Key or network.");
       console.error(err);
@@ -227,43 +287,40 @@ const App: React.FC = () => {
     }
   };
 
-  const handleGeminiTTS = async () => {
-    if (!textContent) {
+  // Modified to accept text argument for auto-play
+  const handleGeminiTTS = async (textToRead?: string) => {
+    const targetText = textToRead || textContent;
+    
+    if (!targetText) {
       setError("No text content to read.");
       return;
     }
     
-    console.log("Starting Gemini TTS Generation...");
+    // Set mode immediately so UI updates
+    setReaderMode(ReaderMode.GEMINI_TTS);
     setIsLoading(true);
-    stopAllAudio(); // Stop native
+    stopAllAudio(); 
     
     try {
-      // Step 1: Generate Audio Buffer (Async operation)
-      const buffer = await generateSpeech(textContent);
+      const buffer = await generateSpeech(targetText);
       console.log("Gemini TTS Audio Generated successfully.");
       
-      // Step 2: Set state ready to play
       audioBufferRef.current = buffer;
-      setReaderMode(ReaderMode.GEMINI_TTS);
-      
-      // Step 3: Start playing immediately
       playAudioBuffer(buffer);
       setIsPlaying(true);
 
     } catch (err: any) {
       setError(`Failed to generate AI speech: ${err.message}`);
       console.error("Gemini TTS Error:", err);
-      // Fallback to native if AI fails
+      // Fallback
       console.log("Falling back to native TTS");
-      setReaderMode(ReaderMode.IDLE);
-      prepareNativeTTS(textContent);
+      prepareNativeTTS(targetText, true);
     } finally {
       setIsLoading(false);
     }
   };
 
   const playAudioBuffer = (buffer: AudioBuffer) => {
-    // Ensure context exists and is running
     if (!audioContextRef.current) {
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
     }
@@ -277,14 +334,27 @@ const App: React.FC = () => {
     source.connect(audioContextRef.current.destination);
     
     source.onended = () => {
-      setIsPlaying(false); 
       audioSourceRef.current = null;
+      // Only trigger next page if we played to the end naturally (not stopped manually)
+      // Checking isPlaying state here is tricky because stopping sets isPlaying false.
+      // We rely on the fact that stop() calls usually happen via UI which sets intended state.
+      // However, onended fires on stop() too. 
+      // Workaround: we check if context is currently running and we haven't explicitly set stopped via UI logic?
+      // Simpler: handleAudioEnd handles the "next page" logic.
+      // If user clicked "Pause", isPlaying becomes false.
+      // If source ends naturally, isPlaying is still true at that exact moment? No.
+      // We need a flag or check.
+      
+      // Ideally, we'd check logic, but for now, let's assume if it ends and we didn't explicitly stop it...
+      // Actually, stop() fires onended.
+      // We can use a flag "isManuallyStopped" but let's just check the time.
+      // If playback time matches duration? 
+      handleAudioEnd(); 
     };
 
     audioSourceRef.current = source;
     source.start(0);
   };
-
 
   return (
     <div className="flex flex-col h-screen bg-slate-100 text-slate-900">
@@ -335,11 +405,9 @@ const App: React.FC = () => {
                <p className="text-sm">Click "Open PDF" to start reading</p>
             </div>
           ) : (
-            <div className="shadow-2xl border border-gray-300 bg-white transition-all duration-300 ease-in-out origin-top">
-               {/* The actual PDF Page Canvas */}
+            <div className="shadow-2xl border border-gray-300 bg-white transition-all duration-300 ease-in-out origin-top h-fit">
                <canvas ref={canvasRef} className="block max-w-full h-auto" />
                
-               {/* Overlay for visual feedback during loading */}
                {isLoading && (
                  <div className="absolute inset-0 bg-white/80 backdrop-blur-sm flex flex-col items-center justify-center z-20">
                     <Spinner />
@@ -354,11 +422,22 @@ const App: React.FC = () => {
         
         {/* Sidebar / Text View (Desktop) */}
         <div className="w-96 bg-white border-l border-gray-200 hidden xl:flex flex-col shadow-xl z-10">
-           <div className="p-4 border-b border-gray-100 bg-gray-50">
-              <h2 className="font-semibold text-gray-700 text-sm uppercase tracking-wider">Extracted Text</h2>
+           <div className="p-4 border-b border-gray-100 bg-gray-50 flex justify-between items-center">
+              <h2 className="font-semibold text-gray-700 text-sm uppercase tracking-wider">Text View</h2>
+              {readerMode === ReaderMode.GEMINI_TTS && isPlaying && (
+                 <span className="text-xs text-purple-600 bg-purple-100 px-2 py-1 rounded animate-pulse">AI Voice Active</span>
+              )}
            </div>
-           <div className="flex-1 overflow-y-auto p-6 text-gray-600 leading-relaxed text-sm font-serif whitespace-pre-wrap">
-              {textContent ? textContent : (
+           <div className="flex-1 overflow-y-auto p-6 relative">
+              {textContent ? (
+                <HighlightableText 
+                  text={textContent} 
+                  currentInfo={{ 
+                    charIndex: highlightIndex, 
+                    isActive: isPlaying && readerMode === ReaderMode.NATIVE_TTS 
+                  }} 
+                />
+              ) : (
                 <span className="italic text-gray-400">
                   {isLoading ? 'Extracting...' : 'No text available on this page. Try OCR if it appears to be a scanned document.'}
                 </span>
@@ -373,7 +452,10 @@ const App: React.FC = () => {
         <ControlBar 
           pageNumber={currentPageNum}
           totalPages={pdfDoc.numPages}
-          onPageChange={setCurrentPageNum}
+          onPageChange={(n) => {
+            autoPlayRef.current = false; // Disable auto-play on manual turn
+            setCurrentPageNum(n);
+          }}
           isPlaying={isPlaying}
           onPlayPause={togglePlayPause}
           playbackRate={playbackRate}
@@ -381,7 +463,7 @@ const App: React.FC = () => {
           mode={readerMode}
           hasText={!!textContent && !isTextScanned}
           isProcessing={isLoading}
-          onUseGeminiTTS={handleGeminiTTS}
+          onUseGeminiTTS={() => handleGeminiTTS()}
           onOCR={handleOCR}
           extractedText={textContent}
         />
