@@ -1,0 +1,5 @@
+{
+  "name": "AI Smart PDF Reader",
+  "description": "A robust PDF reader for Windows/Web that uses local rendering for standard PDFs and Gemini AI for OCR handling of scanned documents and high-quality text-to-speech.",
+  "requestFramePermissions": []
+}
