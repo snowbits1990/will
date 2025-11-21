@@ -6,6 +6,7 @@ import { PDFDocumentProxy, PDFPageProxy, ReaderMode } from './types';
 import ControlBar from './components/ControlBar';
 import { Spinner } from './components/Spinner';
 import { HighlightableText } from './components/HighlightableText';
+import { WaitingOverlay } from './components/WaitingOverlay';
 
 const App: React.FC = () => {
   // Data State
@@ -15,19 +16,20 @@ const App: React.FC = () => {
   const [isTextScanned, setIsTextScanned] = useState(false);
   
   // UI State
-  const [isLoading, setIsLoading] = useState(false);
+  const [isLoading, setIsLoading] = useState(false); // Generic loading (PDF render, etc)
+  const [isGeneratingAI, setIsGeneratingAI] = useState(false); // Specific heavy lifting state for Overlay
   const [error, setError] = useState<string | null>(null);
   const [readerMode, setReaderMode] = useState<ReaderMode>(ReaderMode.IDLE);
   
   // Audio State
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1.0);
-  const [highlightIndex, setHighlightIndex] = useState(0); // Current char index for highlighting relative to FULL text
+  const [highlightIndex, setHighlightIndex] = useState(0); 
 
   // Logic Refs
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const autoPlayRef = useRef<boolean>(false); // Should we auto-play when the next page loads?
+  const autoPlayRef = useRef<boolean>(false); 
   
   // Persistence & Caching Refs
   const previousModeRef = useRef<ReaderMode>(ReaderMode.IDLE); 
@@ -37,20 +39,24 @@ const App: React.FC = () => {
   // Native Audio Refs
   const synthRef = useRef<SpeechSynthesis>(window.speechSynthesis);
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
-  // Tracks where we started the current utterance relative to the whole page text.
-  // This is crucial for resuming playback mid-page when changing speed.
   const currentTextOffsetRef = useRef<number>(0); 
-  const lastKnownCharIndexRef = useRef<number>(0); // Tracks precise current position for pause/resume logic
+  const lastKnownCharIndexRef = useRef<number>(0); 
 
   // Gemini Audio Context Refs
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioSourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const audioBufferRef = useRef<AudioBuffer | null>(null); // Current page buffer
-  const audioStartTimeRef = useRef<number>(0); // When the current source started playing
+  const audioBufferRef = useRef<AudioBuffer | null>(null); 
+  
+  // Refs for closure safety in event handlers
+  const currentPageRef = useRef(1);
+  const isProcessingPageRef = useRef(false);
+
+  useEffect(() => {
+    currentPageRef.current = currentPageNum;
+  }, [currentPageNum]);
 
   // --- Initialization ---
   useEffect(() => {
-    // Cleanup on unmount
     return () => {
       stopAllAudio();
       if (preloadTimeoutRef.current) clearTimeout(preloadTimeoutRef.current);
@@ -58,24 +64,15 @@ const App: React.FC = () => {
   }, []);
 
   const stopAllAudio = () => {
-    // Stop Native
     if (synthRef.current.speaking) {
       synthRef.current.cancel();
     }
-    // Stop Gemini Web Audio
     if (audioSourceRef.current) {
-      // CRITICAL: Remove onended to prevent ghost triggers when we manually stop
       audioSourceRef.current.onended = null; 
       try {
         audioSourceRef.current.stop();
-      } catch (e) { /* ignore if already stopped */ }
+      } catch (e) { /* ignore */ }
       audioSourceRef.current = null;
-    }
-    if (audioContextRef.current) {
-      // We don't close it, just suspend or leave it. 
-      // Suspending here might cause issues if we want to resume immediately, 
-      // so typically we just stop the source.
-      // audioContextRef.current.suspend(); 
     }
     if (preloadTimeoutRef.current) {
       clearTimeout(preloadTimeoutRef.current);
@@ -96,6 +93,7 @@ const App: React.FC = () => {
     }
 
     setIsLoading(true);
+    setIsGeneratingAI(false);
     setError(null);
     stopAllAudio();
     setReaderMode(ReaderMode.IDLE);
@@ -117,14 +115,13 @@ const App: React.FC = () => {
     }
   };
 
-  // --- Preloading Logic (The "50%" Thread) ---
+  // --- Preloading Logic ---
   const preloadNextPageAudio = useCallback(async (nextPageNum: number, doc: PDFDocumentProxy) => {
     if (nextPageNum > doc.numPages) return;
-    if (nextPageAudioCacheRef.current?.page === nextPageNum) return; // Already cached
+    if (nextPageAudioCacheRef.current?.page === nextPageNum) return; 
 
     console.log(`[Cache] Starting background preload for page ${nextPageNum}...`);
     try {
-      // 1. Get Text without rendering canvas (pure data extraction)
       const page = await doc.getPage(nextPageNum);
       const extracted = await extractTextFromPage(page, nextPageNum);
       const cleanText = extracted.text.replace(/\s+/g, ' ').trim();
@@ -134,10 +131,8 @@ const App: React.FC = () => {
         return;
       }
 
-      // 2. Generate Audio
       const buffer = await generateSpeech(cleanText);
       
-      // 3. Store in Cache
       nextPageAudioCacheRef.current = {
         page: nextPageNum,
         buffer: buffer
@@ -146,25 +141,23 @@ const App: React.FC = () => {
       
     } catch (err) {
       console.warn("[Cache] Background preload failed:", err);
-      // Silent fail is okay for preload, we'll just load normally when user gets there
     }
   }, []);
 
   // --- Page Rendering & Text Extraction ---
   const processPage = useCallback(async (pageNum: number, doc: PDFDocumentProxy) => {
-    if (!canvasRef.current) return;
+    if (!canvasRef.current || isProcessingPageRef.current) return;
+    isProcessingPageRef.current = true;
 
     setIsLoading(true);
-    // Stop audio from PREVIOUS page.
     stopAllAudio();
     
-    // Reset tracking refs for the new page
     setHighlightIndex(0);
     currentTextOffsetRef.current = 0;
     lastKnownCharIndexRef.current = 0;
     setTextContent('');
     setIsTextScanned(false);
-    audioBufferRef.current = null; // Clear buffer for new page
+    audioBufferRef.current = null; 
     
     try {
       const page: PDFPageProxy = await doc.getPage(pageNum);
@@ -186,24 +179,18 @@ const App: React.FC = () => {
           console.log(`Auto-play triggered for page ${pageNum}. Mode: ${previousModeRef.current}`);
           
           if (previousModeRef.current === ReaderMode.GEMINI_TTS) {
-            // CHECK CACHE FIRST
             if (nextPageAudioCacheRef.current?.page === pageNum) {
                 console.log("[Cache] Hit! Playing preloaded audio.");
                 const cachedBuffer = nextPageAudioCacheRef.current.buffer;
-                
-                // Clear cache to free memory after consuming
                 nextPageAudioCacheRef.current = null;
                 
-                // Update State
                 setReaderMode(ReaderMode.GEMINI_TTS);
                 audioBufferRef.current = cachedBuffer;
-                setIsPlaying(true); // FORCE UI TO PLAYING STATE
                 playAudioBuffer(cachedBuffer, pageNum, doc);
-                setIsLoading(false); // Done immediately
-                return; // Exit early
+                setIsPlaying(true);
+                setIsLoading(false); 
             } else {
                 console.log("[Cache] Miss. Generating fresh.");
-                // handleGeminiTTS will manage isLoading and isPlaying
                 await handleGeminiTTS(cleanText); 
             }
           } else {
@@ -212,8 +199,6 @@ const App: React.FC = () => {
             setIsLoading(false);
           }
         } else {
-           // Just load text, don't play
-           // Reset to native mode readiness, but don't play
            prepareNativeTTS(cleanText, false);
            setIsLoading(false);
         }
@@ -223,6 +208,8 @@ const App: React.FC = () => {
       console.error(err);
       setError('Error rendering page.');
       setIsLoading(false);
+    } finally {
+      isProcessingPageRef.current = false;
     }
   }, []); 
 
@@ -233,30 +220,33 @@ const App: React.FC = () => {
   }, [pdfDoc, currentPageNum, processPage]);
 
   // --- Handle Page Turn on Audio End ---
-  const handleAudioEnd = () => {
-    if (pdfDoc && currentPageNum < pdfDoc.numPages) {
-      console.log("Audio ended, advancing to next page...");
-      // Critical: Ensure autoPlay remains TRUE
-      autoPlayRef.current = true; 
-      setCurrentPageNum(prev => prev + 1);
-    } else {
-      console.log("Finished reading document.");
-      setIsPlaying(false);
-      setReaderMode(ReaderMode.IDLE);
-      setHighlightIndex(0);
-      currentTextOffsetRef.current = 0;
-      autoPlayRef.current = false;
-    }
-  };
+  // Use a ref to hold the latest version of this function
+  const onAudioEndedRef = useRef<() => void>(() => {});
+  
+  useEffect(() => {
+    onAudioEndedRef.current = () => {
+      const current = currentPageRef.current;
+      if (pdfDoc && current < pdfDoc.numPages) {
+        console.log(`Audio ended for page ${current}. Moving to ${current + 1}`);
+        autoPlayRef.current = true;
+        setCurrentPageNum(current + 1);
+      } else {
+        console.log("Finished reading document.");
+        setIsPlaying(false);
+        setReaderMode(ReaderMode.IDLE);
+        setHighlightIndex(0);
+        currentTextOffsetRef.current = 0;
+        autoPlayRef.current = false;
+      }
+    };
+  }, [pdfDoc]);
 
   // --- Audio Logic: Native ---
   const prepareNativeTTS = (text: string, autoStart: boolean = false, startOffset: number = 0) => {
     if (!text) return;
     
-    // Cancel any existing speech
     synthRef.current.cancel();
 
-    // If we are restarting middle of page, we slice the text
     const textToSpeak = startOffset > 0 ? text.substring(startOffset) : text;
 
     const utterance = new SpeechSynthesisUtterance(textToSpeak);
@@ -271,7 +261,7 @@ const App: React.FC = () => {
     };
 
     utterance.onend = () => {
-       handleAudioEnd();
+       onAudioEndedRef.current();
     };
 
     utterance.onerror = (e) => {
@@ -294,7 +284,7 @@ const App: React.FC = () => {
   // --- Audio Logic: Play/Pause Toggle ---
   const togglePlayPause = async () => {
     if (isPlaying) {
-      // PAUSE logic
+      // PAUSE
       if (readerMode === ReaderMode.NATIVE_TTS) {
         synthRef.current.pause();
       } else if (readerMode === ReaderMode.GEMINI_TTS) {
@@ -305,25 +295,23 @@ const App: React.FC = () => {
       }
       setIsPlaying(false);
     } else {
-      // PLAY logic
+      // PLAY / RESUME
       if (readerMode === ReaderMode.NATIVE_TTS) {
         if (synthRef.current.paused) {
            synthRef.current.resume();
         } else {
-           // Start fresh
+           // Start fresh if stopped
            prepareNativeTTS(textContent, true, currentTextOffsetRef.current);
         }
       } else if (readerMode === ReaderMode.GEMINI_TTS) {
         if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
           await audioContextRef.current.resume();
         } 
-        // Fallback/Resumption Logic
         else {
-           // If we have a buffer and just no source (finished or stopped), replay
+           // Recover if no source
            if(audioBufferRef.current && !audioSourceRef.current) {
                playAudioBuffer(audioBufferRef.current, currentPageNum, pdfDoc!);
            } 
-           // If we have NO buffer (error state or lost), regenerate
            else if (!audioBufferRef.current && textContent) {
                console.log("Buffer missing on play, regenerating...");
                await handleGeminiTTS(textContent);
@@ -380,7 +368,9 @@ const App: React.FC = () => {
     
     setReaderMode(ReaderMode.GEMINI_TTS);
     previousModeRef.current = ReaderMode.GEMINI_TTS;
-    setIsLoading(true);
+    
+    // ACTIVATE OVERLAY
+    setIsGeneratingAI(true);
     stopAllAudio(); 
     
     try {
@@ -398,6 +388,8 @@ const App: React.FC = () => {
       console.error("Gemini TTS Error:", err);
       prepareNativeTTS(targetText, true);
     } finally {
+      // DEACTIVATE OVERLAY
+      setIsGeneratingAI(false);
       setIsLoading(false);
     }
   };
@@ -417,7 +409,7 @@ const App: React.FC = () => {
     
     source.onended = () => {
       audioSourceRef.current = null;
-      handleAudioEnd(); 
+      onAudioEndedRef.current(); 
     };
 
     audioSourceRef.current = source;
@@ -426,6 +418,7 @@ const App: React.FC = () => {
     // --- Preload Logic ---
     if (currentPage < doc.numPages) {
       const duration = buffer.duration; 
+      // Trigger preload at 50%
       const estimatedDelay = (duration * 1000) / 2 / playbackRate;
       
       console.log(`Scheduled cache preload for page ${currentPage + 1} in ${estimatedDelay.toFixed(0)}ms`);
@@ -470,6 +463,9 @@ const App: React.FC = () => {
       {/* Main Content */}
       <main className="flex-1 overflow-hidden flex relative">
         
+        {/* IMMERSIVE OVERLAY for AI Generation */}
+        {isGeneratingAI && <WaitingOverlay />}
+
         {/* PDF View Area */}
         <div className="flex-1 bg-slate-200 overflow-auto flex justify-center p-8 relative">
           {error && (
@@ -490,7 +486,8 @@ const App: React.FC = () => {
             <div className="shadow-2xl border border-gray-300 bg-white transition-all duration-300 ease-in-out origin-top h-fit">
                <canvas ref={canvasRef} className="block max-w-full h-auto" />
                
-               {isLoading && (
+               {/* Standard Spinner for Page Rendering (Not AI Gen) */}
+               {isLoading && !isGeneratingAI && (
                  <div className="absolute inset-0 bg-white/80 backdrop-blur-sm flex flex-col items-center justify-center z-20">
                     <Spinner />
                     <p className="mt-3 text-slate-600 font-medium animate-pulse">
@@ -535,7 +532,7 @@ const App: React.FC = () => {
           pageNumber={currentPageNum}
           totalPages={pdfDoc.numPages}
           onPageChange={(n) => {
-            autoPlayRef.current = false; // Disable auto-play on manual turn
+            autoPlayRef.current = false; 
             setCurrentPageNum(n);
           }}
           isPlaying={isPlaying}
@@ -544,7 +541,7 @@ const App: React.FC = () => {
           onRateChange={handleRateChange}
           mode={readerMode}
           hasText={!!textContent && !isTextScanned}
-          isProcessing={isLoading}
+          isProcessing={isLoading || isGeneratingAI}
           onUseGeminiTTS={() => handleGeminiTTS()}
           onOCR={handleOCR}
           extractedText={textContent}
