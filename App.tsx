@@ -64,13 +64,18 @@ const App: React.FC = () => {
     }
     // Stop Gemini Web Audio
     if (audioSourceRef.current) {
+      // CRITICAL: Remove onended to prevent ghost triggers when we manually stop
+      audioSourceRef.current.onended = null; 
       try {
         audioSourceRef.current.stop();
       } catch (e) { /* ignore if already stopped */ }
       audioSourceRef.current = null;
     }
     if (audioContextRef.current) {
-      audioContextRef.current.suspend();
+      // We don't close it, just suspend or leave it. 
+      // Suspending here might cause issues if we want to resume immediately, 
+      // so typically we just stop the source.
+      // audioContextRef.current.suspend(); 
     }
     if (preloadTimeoutRef.current) {
       clearTimeout(preloadTimeoutRef.current);
@@ -159,6 +164,7 @@ const App: React.FC = () => {
     lastKnownCharIndexRef.current = 0;
     setTextContent('');
     setIsTextScanned(false);
+    audioBufferRef.current = null; // Clear buffer for new page
     
     try {
       const page: PDFPageProxy = await doc.getPage(pageNum);
@@ -171,6 +177,7 @@ const App: React.FC = () => {
       if (extracted.isScanned) {
         setIsTextScanned(true);
         setReaderMode(ReaderMode.IDLE);
+        setIsLoading(false);
       } else {
         setIsTextScanned(false);
         
@@ -187,34 +194,35 @@ const App: React.FC = () => {
                 // Clear cache to free memory after consuming
                 nextPageAudioCacheRef.current = null;
                 
-                // Need to set mode and play
+                // Update State
                 setReaderMode(ReaderMode.GEMINI_TTS);
                 audioBufferRef.current = cachedBuffer;
+                setIsPlaying(true); // FORCE UI TO PLAYING STATE
                 playAudioBuffer(cachedBuffer, pageNum, doc);
                 setIsLoading(false); // Done immediately
                 return; // Exit early
             } else {
                 console.log("[Cache] Miss. Generating fresh.");
-                handleGeminiTTS(cleanText); 
+                // handleGeminiTTS will manage isLoading and isPlaying
+                await handleGeminiTTS(cleanText); 
             }
           } else {
             // Native Auto Play
             prepareNativeTTS(cleanText, true);
+            setIsLoading(false);
           }
         } else {
            // Just load text, don't play
-           // If we were playing native before, we usually reset to beginning of page anyway
+           // Reset to native mode readiness, but don't play
            prepareNativeTTS(cleanText, false);
+           setIsLoading(false);
         }
       }
 
     } catch (err) {
       console.error(err);
       setError('Error rendering page.');
-    } finally {
-      if (previousModeRef.current !== ReaderMode.GEMINI_TTS || !autoPlayRef.current) {
-          setIsLoading(false);
-      }
+      setIsLoading(false);
     }
   }, []); 
 
@@ -228,14 +236,16 @@ const App: React.FC = () => {
   const handleAudioEnd = () => {
     if (pdfDoc && currentPageNum < pdfDoc.numPages) {
       console.log("Audio ended, advancing to next page...");
-      autoPlayRef.current = true;
-      // previousModeRef.current is already set when we started playing
+      // Critical: Ensure autoPlay remains TRUE
+      autoPlayRef.current = true; 
       setCurrentPageNum(prev => prev + 1);
     } else {
+      console.log("Finished reading document.");
       setIsPlaying(false);
       setReaderMode(ReaderMode.IDLE);
       setHighlightIndex(0);
       currentTextOffsetRef.current = 0;
+      autoPlayRef.current = false;
     }
   };
 
@@ -247,7 +257,6 @@ const App: React.FC = () => {
     synthRef.current.cancel();
 
     // If we are restarting middle of page, we slice the text
-    // But we need to map the boundary indices back to the full text
     const textToSpeak = startOffset > 0 ? text.substring(startOffset) : text;
 
     const utterance = new SpeechSynthesisUtterance(textToSpeak);
@@ -255,7 +264,6 @@ const App: React.FC = () => {
     
     utterance.onboundary = (event) => {
       if (event.name === 'word' || event.name === 'sentence') {
-        // Accurate global index = Offset + Current Utterance Index
         const globalIndex = startOffset + event.charIndex;
         setHighlightIndex(globalIndex);
         lastKnownCharIndexRef.current = globalIndex;
@@ -263,10 +271,7 @@ const App: React.FC = () => {
     };
 
     utterance.onend = () => {
-      // Only advance if we reached the end of the FULL text, not just a segment
-      // Actually onend fires when the specific utterance finishes. 
-      // Since we speak to the end of the string, this is fine.
-      handleAudioEnd();
+       handleAudioEnd();
     };
 
     utterance.onerror = (e) => {
@@ -296,7 +301,6 @@ const App: React.FC = () => {
         if (audioContextRef.current) {
           await audioContextRef.current.suspend();
         }
-        // Clear preload timeout on pause to save resources/logic
         if (preloadTimeoutRef.current) clearTimeout(preloadTimeoutRef.current);
       }
       setIsPlaying(false);
@@ -307,16 +311,22 @@ const App: React.FC = () => {
            synthRef.current.resume();
         } else {
            // Start fresh
-           prepareNativeTTS(textContent, true, 0);
+           prepareNativeTTS(textContent, true, currentTextOffsetRef.current);
         }
       } else if (readerMode === ReaderMode.GEMINI_TTS) {
         if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
           await audioContextRef.current.resume();
-        } else {
+        } 
+        // Fallback/Resumption Logic
+        else {
+           // If we have a buffer and just no source (finished or stopped), replay
            if(audioBufferRef.current && !audioSourceRef.current) {
-               // Resume from start of buffer (Gemini doesn't support seek easily without complexities)
-               // For V1, replaying page is safer, or we assume suspend/resume handled it.
                playAudioBuffer(audioBufferRef.current, currentPageNum, pdfDoc!);
+           } 
+           // If we have NO buffer (error state or lost), regenerate
+           else if (!audioBufferRef.current && textContent) {
+               console.log("Buffer missing on play, regenerating...");
+               await handleGeminiTTS(textContent);
            }
         }
       }
@@ -329,21 +339,13 @@ const App: React.FC = () => {
     setPlaybackRate(rate);
     
     if (readerMode === ReaderMode.NATIVE_TTS && isPlaying) {
-      // Smart Restart Logic for Native TTS
       if (synthRef.current.speaking) {
         synthRef.current.cancel();
-        
-        // Use the last known character index as the new offset
-        // We back up slightly (e.g. 50 chars) or to the start of the last sentence to make it sound natural?
-        // For now, strict resume is requested.
         const resumeIndex = lastKnownCharIndexRef.current;
         currentTextOffsetRef.current = resumeIndex;
-
-        console.log(`Changing speed to ${rate}x. Resuming from index ${resumeIndex}`);
         prepareNativeTTS(textContent, true, resumeIndex);
       }
     } else if (readerMode === ReaderMode.GEMINI_TTS) {
-        // Web Audio API allows dynamic rate change without restart
         if (audioSourceRef.current) {
             audioSourceRef.current.playbackRate.value = rate;
         }
@@ -376,7 +378,6 @@ const App: React.FC = () => {
       return;
     }
     
-    // Set mode immediately so UI updates
     setReaderMode(ReaderMode.GEMINI_TTS);
     previousModeRef.current = ReaderMode.GEMINI_TTS;
     setIsLoading(true);
@@ -395,8 +396,6 @@ const App: React.FC = () => {
     } catch (err: any) {
       setError(`Failed to generate AI speech: ${err.message}`);
       console.error("Gemini TTS Error:", err);
-      // Fallback
-      console.log("Falling back to native TTS");
       prepareNativeTTS(targetText, true);
     } finally {
       setIsLoading(false);
@@ -425,14 +424,8 @@ const App: React.FC = () => {
     source.start(0);
 
     // --- Preload Logic ---
-    // Schedule preloading of next page when this one is 50% done.
     if (currentPage < doc.numPages) {
-      const duration = buffer.duration; // in seconds
-      // We want to trigger at 50%. 
-      // Note: Changing playbackRate changes *actual* time, but setTimeout uses wall clock.
-      // Roughly, if speed is 1.0, wait duration/2.
-      // If speed is 2.0, we should wait duration/4. 
-      // Let's use current rate estimate.
+      const duration = buffer.duration; 
       const estimatedDelay = (duration * 1000) / 2 / playbackRate;
       
       console.log(`Scheduled cache preload for page ${currentPage + 1} in ${estimatedDelay.toFixed(0)}ms`);
