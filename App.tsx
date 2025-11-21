@@ -30,6 +30,7 @@ const App: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const autoPlayRef = useRef<boolean>(false); 
+  const playbackRateRef = useRef(1.0);
   
   // Persistence & Caching Refs
   const previousModeRef = useRef<ReaderMode>(ReaderMode.IDLE); 
@@ -54,6 +55,11 @@ const App: React.FC = () => {
   useEffect(() => {
     currentPageRef.current = currentPageNum;
   }, [currentPageNum]);
+
+  // Sync playbackRate state to Ref for stable access in callbacks
+  useEffect(() => {
+    playbackRateRef.current = playbackRate;
+  }, [playbackRate]);
 
   // --- Initialization ---
   useEffect(() => {
@@ -125,7 +131,7 @@ const App: React.FC = () => {
     const textToSpeak = startOffset > 0 ? text.substring(startOffset) : text;
 
     const utterance = new SpeechSynthesisUtterance(textToSpeak);
-    utterance.rate = playbackRate; // Note: This captures current playbackRate
+    utterance.rate = playbackRateRef.current; // Use Ref to avoid dependency chain
     
     utterance.onboundary = (event) => {
       if (event.name === 'word' || event.name === 'sentence') {
@@ -154,7 +160,7 @@ const App: React.FC = () => {
     } else {
       setIsPlaying(false);
     }
-  }, [playbackRate]);
+  }, []); // Dependencies removed to keep processPage stable
 
   // --- Preloading Logic ---
   const preloadNextPageAudio = useCallback(async (nextPageNum: number, doc: PDFDocumentProxy) => {
@@ -219,7 +225,7 @@ const App: React.FC = () => {
     
     const source = audioContextRef.current.createBufferSource();
     source.buffer = buffer;
-    source.playbackRate.value = playbackRate;
+    source.playbackRate.value = playbackRateRef.current; // Use Ref
     source.connect(audioContextRef.current.destination);
     
     source.onended = () => {
@@ -234,8 +240,10 @@ const App: React.FC = () => {
     // --- Preload Logic ---
     if (pageForAudio < doc.numPages) {
       const duration = buffer.duration; 
-      // Trigger preload at 50% progress
-      const estimatedDelay = (duration * 1000) / 2 / playbackRate;
+      // Trigger preload at 20% progress
+      // Calculate real time duration considering playback rate
+      const currentRate = playbackRateRef.current || 1;
+      const estimatedDelay = (duration * 1000 * 0.2) / currentRate;
       
       console.log(`Scheduled cache preload for page ${pageForAudio + 1} in ${estimatedDelay.toFixed(0)}ms`);
       
@@ -245,7 +253,7 @@ const App: React.FC = () => {
         preloadNextPageAudio(pageForAudio + 1, doc);
       }, estimatedDelay);
     }
-  }, [playbackRate, preloadNextPageAudio]);
+  }, [preloadNextPageAudio]); // Dependencies removed to keep processPage stable
 
   const handleGeminiTTS = useCallback(async (textToRead: string, pageNum: number) => {
     if (!textToRead) {
@@ -289,7 +297,6 @@ const App: React.FC = () => {
 
     setIsLoading(true);
     // Only stop audio if we are NOT transitioning automatically with cache
-    // Actually, safe to stop previous page audio as we are about to start new one
     stopAllAudio();
     
     setHighlightIndex(0);
@@ -307,43 +314,53 @@ const App: React.FC = () => {
       const cleanText = extracted.text.replace(/\s+/g, ' ').trim();
       setTextContent(cleanText);
       
-      if (extracted.isScanned) {
-        setIsTextScanned(true);
+      // Check for valid text content
+      const hasContent = cleanText.length > 0 && !extracted.isScanned;
+
+      if (!hasContent) {
+        setIsTextScanned(extracted.isScanned);
         setReaderMode(ReaderMode.IDLE);
         setIsLoading(false);
-      } else {
-        setIsTextScanned(false);
+
+        // AUTO SKIP Logic: If playing, skip to next page if available
+        if (autoPlayRef.current && pageNum < doc.numPages) {
+            console.log(`[AutoPlay] Page ${pageNum} has no readable content. Skipping to next...`);
+            setCurrentPageNum(prev => prev + 1);
+        }
+        return;
+      }
+      
+      // If we have content
+      setIsTextScanned(false);
         
-        // --- Auto Play Logic with Cache Check ---
-        if (autoPlayRef.current && cleanText.length > 0) {
-          console.log(`Auto-play triggered for page ${pageNum}. Mode: ${previousModeRef.current}`);
-          
-          if (previousModeRef.current === ReaderMode.GEMINI_TTS) {
-            if (nextPageAudioCacheRef.current?.page === pageNum) {
-                console.log("[Cache] Hit! Playing preloaded audio.");
-                const cachedBuffer = nextPageAudioCacheRef.current.buffer;
-                nextPageAudioCacheRef.current = null;
-                
-                setReaderMode(ReaderMode.GEMINI_TTS);
-                audioBufferRef.current = cachedBuffer;
-                playAudioBuffer(cachedBuffer, pageNum, doc);
-                setIsPlaying(true);
-                setIsLoading(false); 
-            } else {
-                console.log("[Cache] Miss. Generating fresh.");
-                // Pass pageNum explicitly to avoid closure staleness
-                await handleGeminiTTS(cleanText, pageNum); 
-            }
+      // --- Auto Play Logic with Cache Check ---
+      if (autoPlayRef.current) {
+        console.log(`Auto-play triggered for page ${pageNum}. Mode: ${previousModeRef.current}`);
+        
+        if (previousModeRef.current === ReaderMode.GEMINI_TTS) {
+          if (nextPageAudioCacheRef.current?.page === pageNum) {
+              console.log("[Cache] Hit! Playing preloaded audio.");
+              const cachedBuffer = nextPageAudioCacheRef.current.buffer;
+              nextPageAudioCacheRef.current = null;
+              
+              setReaderMode(ReaderMode.GEMINI_TTS);
+              audioBufferRef.current = cachedBuffer;
+              playAudioBuffer(cachedBuffer, pageNum, doc);
+              setIsPlaying(true);
+              setIsLoading(false); 
           } else {
-            // Native Auto Play
-            prepareNativeTTS(cleanText, true);
-            setIsLoading(false);
+              console.log("[Cache] Miss. Generating fresh.");
+              await handleGeminiTTS(cleanText, pageNum); 
           }
         } else {
-           // Just prep, don't play
-           prepareNativeTTS(cleanText, false);
-           setIsLoading(false);
+          // Native Auto Play
+          prepareNativeTTS(cleanText, true);
+          setIsLoading(false);
         }
+      } else {
+          // Just prep, don't play
+          prepareNativeTTS(cleanText, false);
+          setIsLoading(false);
       }
 
     } catch (err) {
@@ -407,6 +424,7 @@ const App: React.FC = () => {
   // --- Audio Logic: Speed ---
   const handleRateChange = (rate: number) => {
     setPlaybackRate(rate);
+    playbackRateRef.current = rate; // Immediate update for synchronous calls
     
     if (readerMode === ReaderMode.NATIVE_TTS && isPlaying) {
       if (synthRef.current.speaking) {
@@ -417,7 +435,13 @@ const App: React.FC = () => {
       }
     } else if (readerMode === ReaderMode.GEMINI_TTS) {
         if (audioSourceRef.current) {
-            audioSourceRef.current.playbackRate.value = rate;
+            // Apply smooth speed change without restarting
+            try {
+              audioSourceRef.current.playbackRate.setValueAtTime(rate, audioContextRef.current?.currentTime || 0);
+            } catch(e) {
+              // Fallback just in case
+              audioSourceRef.current.playbackRate.value = rate;
+            }
         }
     }
   };
