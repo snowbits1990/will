@@ -34,7 +34,10 @@ const App: React.FC = () => {
   
   // Persistence & Caching Refs
   const previousModeRef = useRef<ReaderMode>(ReaderMode.IDLE); 
-  const nextPageAudioCacheRef = useRef<{ page: number; buffer: AudioBuffer } | null>(null);
+  // Changed from single object to a Map to store multiple pages
+  const audioCacheRef = useRef<Map<number, AudioBuffer>>(new Map());
+  // Track which pages are currently being fetched to avoid duplicate requests
+  const activeFetchSetRef = useRef<Set<number>>(new Set());
   const preloadTimeoutRef = useRef<any>(null);
 
   // Native Audio Refs
@@ -104,7 +107,11 @@ const App: React.FC = () => {
     stopAllAudio();
     setReaderMode(ReaderMode.IDLE);
     previousModeRef.current = ReaderMode.IDLE;
-    nextPageAudioCacheRef.current = null;
+    
+    // Clear caches
+    audioCacheRef.current.clear();
+    activeFetchSetRef.current.clear();
+    
     autoPlayRef.current = false;
     currentTextOffsetRef.current = 0;
     lastKnownCharIndexRef.current = 0;
@@ -162,32 +169,56 @@ const App: React.FC = () => {
     }
   }, []); // Dependencies removed to keep processPage stable
 
-  // --- Preloading Logic ---
-  const preloadNextPageAudio = useCallback(async (nextPageNum: number, doc: PDFDocumentProxy) => {
-    if (nextPageNum > doc.numPages) return;
-    if (nextPageAudioCacheRef.current?.page === nextPageNum) return; 
+  // --- Smart Preloading Logic (Multi-page) ---
+  const runSmartCaching = useCallback(async (startFromPage: number, doc: PDFDocumentProxy) => {
+    const CACHE_LIMIT = 5; // Cache up to 5 pages ahead
 
-    console.log(`[Cache] Starting background preload for page ${nextPageNum}...`);
-    try {
-      const page = await doc.getPage(nextPageNum);
-      const extracted = await extractTextFromPage(page, nextPageNum);
-      const cleanText = extracted.text.replace(/\s+/g, ' ').trim();
+    // We loop sequentially to avoid hammering the API with 5 simultaneous requests
+    // This ensures a steady stream without network congestion.
+    for (let i = 0; i < CACHE_LIMIT; i++) {
+      const targetPage = startFromPage + i;
 
-      if (!cleanText || extracted.isScanned) {
-        console.log(`[Cache] Page ${nextPageNum} is empty or scanned. Skipping audio preload.`);
-        return;
+      // Stop if we reach end of doc
+      if (targetPage > doc.numPages) break;
+
+      // Optimization: If user stopped playing, we might want to stop caching to save credits/resources.
+      // However, keeping a small buffer is good. Let's check if mode changed.
+      if (previousModeRef.current !== ReaderMode.GEMINI_TTS) break;
+
+      // Skip if already cached
+      if (audioCacheRef.current.has(targetPage)) {
+        continue;
       }
 
-      const buffer = await generateSpeech(cleanText);
-      
-      nextPageAudioCacheRef.current = {
-        page: nextPageNum,
-        buffer: buffer
-      };
-      console.log(`[Cache] Successfully preloaded audio for page ${nextPageNum}`);
-      
-    } catch (err) {
-      console.warn("[Cache] Background preload failed:", err);
+      // Skip if currently being fetched
+      if (activeFetchSetRef.current.has(targetPage)) {
+        continue;
+      }
+
+      try {
+        activeFetchSetRef.current.add(targetPage);
+        console.log(`[SmartCache] Prefetching page ${targetPage}...`);
+
+        const page = await doc.getPage(targetPage);
+        const extracted = await extractTextFromPage(page, targetPage);
+        const cleanText = extracted.text.replace(/\s+/g, ' ').trim();
+
+        // If text is empty or scanned, we can't generate audio, so we skip storing audio
+        if (!cleanText || extracted.isScanned) {
+          console.log(`[SmartCache] Page ${targetPage} empty/scanned. Skipping audio generation.`);
+        } else {
+          // Generate Audio
+          const buffer = await generateSpeech(cleanText);
+          
+          // Store in Map
+          audioCacheRef.current.set(targetPage, buffer);
+          console.log(`[SmartCache] Successfully cached audio for page ${targetPage}`);
+        }
+      } catch (err) {
+        console.warn(`[SmartCache] Failed to cache page ${targetPage}`, err);
+      } finally {
+        activeFetchSetRef.current.delete(targetPage);
+      }
     }
   }, []);
 
@@ -237,23 +268,23 @@ const App: React.FC = () => {
     audioSourceRef.current = source;
     source.start(0);
 
-    // --- Preload Logic ---
+    // --- Preload Logic Trigger ---
     if (pageForAudio < doc.numPages) {
       const duration = buffer.duration; 
       // Trigger preload at 20% progress
-      // Calculate real time duration considering playback rate
       const currentRate = playbackRateRef.current || 1;
       const estimatedDelay = (duration * 1000 * 0.2) / currentRate;
       
-      console.log(`Scheduled cache preload for page ${pageForAudio + 1} in ${estimatedDelay.toFixed(0)}ms`);
+      console.log(`Scheduled smart caching starting from page ${pageForAudio + 1} in ${estimatedDelay.toFixed(0)}ms`);
       
       if (preloadTimeoutRef.current) clearTimeout(preloadTimeoutRef.current);
       
       preloadTimeoutRef.current = setTimeout(() => {
-        preloadNextPageAudio(pageForAudio + 1, doc);
+        // Start caching sequence for next 5 pages
+        runSmartCaching(pageForAudio + 1, doc);
       }, estimatedDelay);
     }
-  }, [preloadNextPageAudio]); // Dependencies removed to keep processPage stable
+  }, [runSmartCaching]); // Dependencies removed to keep processPage stable
 
   const handleGeminiTTS = useCallback(async (textToRead: string, pageNum: number) => {
     if (!textToRead) {
@@ -338,10 +369,13 @@ const App: React.FC = () => {
         console.log(`Auto-play triggered for page ${pageNum}. Mode: ${previousModeRef.current}`);
         
         if (previousModeRef.current === ReaderMode.GEMINI_TTS) {
-          if (nextPageAudioCacheRef.current?.page === pageNum) {
-              console.log("[Cache] Hit! Playing preloaded audio.");
-              const cachedBuffer = nextPageAudioCacheRef.current.buffer;
-              nextPageAudioCacheRef.current = null;
+          // Check if we have this page in the multi-page cache
+          if (audioCacheRef.current.has(pageNum)) {
+              console.log(`[Cache] Hit for Page ${pageNum}! Playing preloaded audio.`);
+              const cachedBuffer = audioCacheRef.current.get(pageNum)!;
+              
+              // Remove used page from cache to free memory
+              audioCacheRef.current.delete(pageNum);
               
               setReaderMode(ReaderMode.GEMINI_TTS);
               audioBufferRef.current = cachedBuffer;
@@ -349,7 +383,7 @@ const App: React.FC = () => {
               setIsPlaying(true);
               setIsLoading(false); 
           } else {
-              console.log("[Cache] Miss. Generating fresh.");
+              console.log(`[Cache] Miss for Page ${pageNum}. Generating fresh.`);
               await handleGeminiTTS(cleanText, pageNum); 
           }
         } else {
