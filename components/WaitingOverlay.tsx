@@ -1,9 +1,8 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { quotes } from '../data/quotes';
-import { Music, Sparkles, Volume2 } from 'lucide-react';
+import { Music, Sparkles } from 'lucide-react';
 
 // Using a reliable source for Gymnopédie No.1.
-// Direct generic MP3 link is often more reliable for simple <audio> tags than OGG transcoding links.
 const MUSIC_URL = "https://upload.wikimedia.org/wikipedia/commons/3/34/Erik_Satie_-_Gymnop%C3%A9die_No._1.mp3";
 
 export const WaitingOverlay: React.FC = () => {
@@ -31,46 +30,35 @@ export const WaitingOverlay: React.FC = () => {
   }, []);
 
   // Handle Audio
-  useEffect(() => {
+  const tryPlayMusic = () => {
     const audio = audioRef.current;
-    if (!audio) return;
-
-    audio.volume = 0; // Start silent
+    if (!audio || isPlaying) return;
     
-    // Attempt to play
-    const playPromise = audio.play();
-    
-    if (playPromise !== undefined) {
-      playPromise
-        .then(() => {
-          setIsPlaying(true);
-          console.log("Background music started.");
-          // Start Fade In
-          let vol = 0;
-          const fadeInterval = setInterval(() => {
-            if (vol < 0.5) { // Target volume
-              vol += 0.05; // Faster fade in
-              // Ensure volume doesn't exceed 1
-              audio.volume = Math.min(vol, 1);
-            } else {
-              clearInterval(fadeInterval);
-            }
-          }, 200);
+    audio.volume = 0; 
+    audio.play()
+      .then(() => {
+        setIsPlaying(true);
+        // Fade in
+        let vol = 0;
+        const fadeInterval = setInterval(() => {
+          if (vol < 0.5) { 
+            vol += 0.05; 
+            audio.volume = Math.min(vol, 1);
+          } else {
+            clearInterval(fadeInterval);
+          }
+        }, 200);
+      })
+      .catch(e => console.log("Waiting for interaction", e));
+  };
 
-          // Store interval to clear on unmount
-          return () => clearInterval(fadeInterval);
-        })
-        .catch(error => {
-          console.warn("Auto-play prevented. Browser requires interaction.", error);
-          setIsPlaying(false);
-        });
-    }
+  useEffect(() => {
+    // Try auto-play on mount
+    tryPlayMusic();
 
     return () => {
-      // Quick fade out on unmount
-      if (audio) {
-        audio.pause();
-        audio.currentTime = 0;
+      if (audioRef.current) {
+        audioRef.current.pause();
       }
     };
   }, []);
@@ -78,7 +66,10 @@ export const WaitingOverlay: React.FC = () => {
   const quote = quotes[currentQuoteIndex];
 
   return (
-    <div className="absolute inset-0 z-50 flex flex-col items-center justify-center overflow-hidden bg-slate-900/80 backdrop-blur-xl transition-all duration-700">
+    <div 
+      onClick={tryPlayMusic}
+      className="absolute inset-0 z-50 flex flex-col items-center justify-center overflow-hidden bg-slate-900/80 backdrop-blur-xl transition-all duration-700 cursor-pointer"
+    >
       
       {/* Audio Element */}
       <audio ref={audioRef} src={MUSIC_URL} loop preload="auto" />
@@ -89,7 +80,7 @@ export const WaitingOverlay: React.FC = () => {
         <div className="absolute bottom-1/3 right-1/4 w-96 h-96 bg-purple-500 rounded-full mix-blend-multiply filter blur-3xl animate-pulse" style={{ animationDelay: '2s' }}></div>
       </div>
 
-      <div className="z-10 max-w-4xl px-8 text-center">
+      <div className="z-10 max-w-4xl px-8 text-center pointer-events-none">
         {/* Animated Icon */}
         <div className="mb-12 flex justify-center">
           <div className="relative">
@@ -121,7 +112,9 @@ export const WaitingOverlay: React.FC = () => {
             <span>正在生成 AI 语音体验...</span>
           </div>
           {!isPlaying && (
-             <span className="text-xs opacity-50">(点击页面以启用背景音乐)</span>
+             <span className="text-xs opacity-70 animate-pulse font-normal text-indigo-200 border border-indigo-200/30 px-2 py-1 rounded-full bg-indigo-500/10">
+               (点击屏幕任意处开启背景音乐)
+             </span>
           )}
         </div>
       </div>

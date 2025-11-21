@@ -115,6 +115,47 @@ const App: React.FC = () => {
     }
   };
 
+  // --- Audio Logic: Native ---
+  // Defined early so it can be used in other callbacks
+  const prepareNativeTTS = useCallback((text: string, autoStart: boolean = false, startOffset: number = 0) => {
+    if (!text) return;
+    
+    synthRef.current.cancel();
+
+    const textToSpeak = startOffset > 0 ? text.substring(startOffset) : text;
+
+    const utterance = new SpeechSynthesisUtterance(textToSpeak);
+    utterance.rate = playbackRate; // Note: This captures current playbackRate
+    
+    utterance.onboundary = (event) => {
+      if (event.name === 'word' || event.name === 'sentence') {
+        const globalIndex = startOffset + event.charIndex;
+        setHighlightIndex(globalIndex);
+        lastKnownCharIndexRef.current = globalIndex;
+      }
+    };
+
+    utterance.onend = () => {
+       onAudioEndedRef.current();
+    };
+
+    utterance.onerror = (e) => {
+      console.error("Native TTS Error", e);
+      setIsPlaying(false);
+    };
+
+    utteranceRef.current = utterance;
+    setReaderMode(ReaderMode.NATIVE_TTS);
+    previousModeRef.current = ReaderMode.NATIVE_TTS;
+    
+    if (autoStart) {
+      setIsPlaying(true);
+      synthRef.current.speak(utterance);
+    } else {
+      setIsPlaying(false);
+    }
+  }, [playbackRate]);
+
   // --- Preloading Logic ---
   const preloadNextPageAudio = useCallback(async (nextPageNum: number, doc: PDFDocumentProxy) => {
     if (nextPageNum > doc.numPages) return;
@@ -144,12 +185,111 @@ const App: React.FC = () => {
     }
   }, []);
 
+  // --- Handle Audio End (Page Turn) ---
+  // This ref holds the latest logic to execute when audio finishes
+  const onAudioEndedRef = useRef<() => void>(() => {});
+  
+  useEffect(() => {
+    onAudioEndedRef.current = () => {
+      const current = currentPageRef.current;
+      if (pdfDoc && current < pdfDoc.numPages) {
+        console.log(`Audio ended for page ${current}. Moving to ${current + 1}`);
+        // CRITICAL: Set autoPlay intent BEFORE state update trigger
+        autoPlayRef.current = true;
+        setCurrentPageNum(current + 1);
+      } else {
+        console.log("Finished reading document.");
+        setIsPlaying(false);
+        setReaderMode(ReaderMode.IDLE);
+        setHighlightIndex(0);
+        currentTextOffsetRef.current = 0;
+        autoPlayRef.current = false;
+      }
+    };
+  }, [pdfDoc]);
+
+  // --- Gemini Audio Playback ---
+  const playAudioBuffer = useCallback((buffer: AudioBuffer, pageForAudio: number, doc: PDFDocumentProxy) => {
+    if (!audioContextRef.current) {
+      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+    }
+    if (audioContextRef.current.state === 'suspended') {
+      audioContextRef.current.resume();
+    }
+    
+    const source = audioContextRef.current.createBufferSource();
+    source.buffer = buffer;
+    source.playbackRate.value = playbackRate;
+    source.connect(audioContextRef.current.destination);
+    
+    source.onended = () => {
+      audioSourceRef.current = null;
+      // Always call the ref to ensure we use the latest logic/state
+      onAudioEndedRef.current(); 
+    };
+
+    audioSourceRef.current = source;
+    source.start(0);
+
+    // --- Preload Logic ---
+    if (pageForAudio < doc.numPages) {
+      const duration = buffer.duration; 
+      // Trigger preload at 50% progress
+      const estimatedDelay = (duration * 1000) / 2 / playbackRate;
+      
+      console.log(`Scheduled cache preload for page ${pageForAudio + 1} in ${estimatedDelay.toFixed(0)}ms`);
+      
+      if (preloadTimeoutRef.current) clearTimeout(preloadTimeoutRef.current);
+      
+      preloadTimeoutRef.current = setTimeout(() => {
+        preloadNextPageAudio(pageForAudio + 1, doc);
+      }, estimatedDelay);
+    }
+  }, [playbackRate, preloadNextPageAudio]);
+
+  const handleGeminiTTS = useCallback(async (textToRead: string, pageNum: number) => {
+    if (!textToRead) {
+      setError("No text content to read.");
+      return;
+    }
+    
+    setReaderMode(ReaderMode.GEMINI_TTS);
+    previousModeRef.current = ReaderMode.GEMINI_TTS;
+    
+    // ACTIVATE OVERLAY
+    setIsGeneratingAI(true);
+    stopAllAudio(); 
+    
+    try {
+      const buffer = await generateSpeech(textToRead);
+      console.log(`Gemini TTS Audio Generated successfully for page ${pageNum}.`);
+      
+      audioBufferRef.current = buffer;
+      if (pdfDoc) {
+        playAudioBuffer(buffer, pageNum, pdfDoc);
+      }
+      setIsPlaying(true);
+
+    } catch (err: any) {
+      setError(`Failed to generate AI speech: ${err.message}`);
+      console.error("Gemini TTS Error:", err);
+      prepareNativeTTS(textToRead, true);
+    } finally {
+      // DEACTIVATE OVERLAY
+      setIsGeneratingAI(false);
+      setIsLoading(false);
+    }
+  }, [pdfDoc, playAudioBuffer, prepareNativeTTS]);
+
+
   // --- Page Rendering & Text Extraction ---
   const processPage = useCallback(async (pageNum: number, doc: PDFDocumentProxy) => {
     if (!canvasRef.current || isProcessingPageRef.current) return;
     isProcessingPageRef.current = true;
 
     setIsLoading(true);
+    // Only stop audio if we are NOT transitioning automatically with cache
+    // Actually, safe to stop previous page audio as we are about to start new one
     stopAllAudio();
     
     setHighlightIndex(0);
@@ -191,7 +331,8 @@ const App: React.FC = () => {
                 setIsLoading(false); 
             } else {
                 console.log("[Cache] Miss. Generating fresh.");
-                await handleGeminiTTS(cleanText); 
+                // Pass pageNum explicitly to avoid closure staleness
+                await handleGeminiTTS(cleanText, pageNum); 
             }
           } else {
             // Native Auto Play
@@ -199,6 +340,7 @@ const App: React.FC = () => {
             setIsLoading(false);
           }
         } else {
+           // Just prep, don't play
            prepareNativeTTS(cleanText, false);
            setIsLoading(false);
         }
@@ -211,75 +353,15 @@ const App: React.FC = () => {
     } finally {
       isProcessingPageRef.current = false;
     }
-  }, []); 
+  }, [playAudioBuffer, handleGeminiTTS, prepareNativeTTS]); 
 
+  // Trigger Page Processing when Page changes
   useEffect(() => {
     if (pdfDoc) {
       processPage(currentPageNum, pdfDoc);
     }
   }, [pdfDoc, currentPageNum, processPage]);
 
-  // --- Handle Page Turn on Audio End ---
-  // Use a ref to hold the latest version of this function
-  const onAudioEndedRef = useRef<() => void>(() => {});
-  
-  useEffect(() => {
-    onAudioEndedRef.current = () => {
-      const current = currentPageRef.current;
-      if (pdfDoc && current < pdfDoc.numPages) {
-        console.log(`Audio ended for page ${current}. Moving to ${current + 1}`);
-        autoPlayRef.current = true;
-        setCurrentPageNum(current + 1);
-      } else {
-        console.log("Finished reading document.");
-        setIsPlaying(false);
-        setReaderMode(ReaderMode.IDLE);
-        setHighlightIndex(0);
-        currentTextOffsetRef.current = 0;
-        autoPlayRef.current = false;
-      }
-    };
-  }, [pdfDoc]);
-
-  // --- Audio Logic: Native ---
-  const prepareNativeTTS = (text: string, autoStart: boolean = false, startOffset: number = 0) => {
-    if (!text) return;
-    
-    synthRef.current.cancel();
-
-    const textToSpeak = startOffset > 0 ? text.substring(startOffset) : text;
-
-    const utterance = new SpeechSynthesisUtterance(textToSpeak);
-    utterance.rate = playbackRate;
-    
-    utterance.onboundary = (event) => {
-      if (event.name === 'word' || event.name === 'sentence') {
-        const globalIndex = startOffset + event.charIndex;
-        setHighlightIndex(globalIndex);
-        lastKnownCharIndexRef.current = globalIndex;
-      }
-    };
-
-    utterance.onend = () => {
-       onAudioEndedRef.current();
-    };
-
-    utterance.onerror = (e) => {
-      console.error("Native TTS Error", e);
-      setIsPlaying(false);
-    };
-
-    utteranceRef.current = utterance;
-    setReaderMode(ReaderMode.NATIVE_TTS);
-    previousModeRef.current = ReaderMode.NATIVE_TTS;
-    
-    if (autoStart) {
-      setIsPlaying(true);
-      synthRef.current.speak(utterance);
-    } else {
-      setIsPlaying(false);
-    }
-  };
 
   // --- Audio Logic: Play/Pause Toggle ---
   const togglePlayPause = async () => {
@@ -309,12 +391,12 @@ const App: React.FC = () => {
         } 
         else {
            // Recover if no source
-           if(audioBufferRef.current && !audioSourceRef.current) {
-               playAudioBuffer(audioBufferRef.current, currentPageNum, pdfDoc!);
+           if(audioBufferRef.current && !audioSourceRef.current && pdfDoc) {
+               playAudioBuffer(audioBufferRef.current, currentPageNum, pdfDoc);
            } 
            else if (!audioBufferRef.current && textContent) {
                console.log("Buffer missing on play, regenerating...");
-               await handleGeminiTTS(textContent);
+               await handleGeminiTTS(textContent, currentPageNum);
            }
         }
       }
@@ -355,79 +437,6 @@ const App: React.FC = () => {
       console.error(err);
     } finally {
       setIsLoading(false);
-    }
-  };
-
-  const handleGeminiTTS = async (textToRead?: string) => {
-    const targetText = textToRead || textContent;
-    
-    if (!targetText) {
-      setError("No text content to read.");
-      return;
-    }
-    
-    setReaderMode(ReaderMode.GEMINI_TTS);
-    previousModeRef.current = ReaderMode.GEMINI_TTS;
-    
-    // ACTIVATE OVERLAY
-    setIsGeneratingAI(true);
-    stopAllAudio(); 
-    
-    try {
-      const buffer = await generateSpeech(targetText);
-      console.log("Gemini TTS Audio Generated successfully.");
-      
-      audioBufferRef.current = buffer;
-      if (pdfDoc) {
-        playAudioBuffer(buffer, currentPageNum, pdfDoc);
-      }
-      setIsPlaying(true);
-
-    } catch (err: any) {
-      setError(`Failed to generate AI speech: ${err.message}`);
-      console.error("Gemini TTS Error:", err);
-      prepareNativeTTS(targetText, true);
-    } finally {
-      // DEACTIVATE OVERLAY
-      setIsGeneratingAI(false);
-      setIsLoading(false);
-    }
-  };
-
-  const playAudioBuffer = (buffer: AudioBuffer, currentPage: number, doc: PDFDocumentProxy) => {
-    if (!audioContextRef.current) {
-      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-    }
-    if (audioContextRef.current.state === 'suspended') {
-      audioContextRef.current.resume();
-    }
-    
-    const source = audioContextRef.current.createBufferSource();
-    source.buffer = buffer;
-    source.playbackRate.value = playbackRate;
-    source.connect(audioContextRef.current.destination);
-    
-    source.onended = () => {
-      audioSourceRef.current = null;
-      onAudioEndedRef.current(); 
-    };
-
-    audioSourceRef.current = source;
-    source.start(0);
-
-    // --- Preload Logic ---
-    if (currentPage < doc.numPages) {
-      const duration = buffer.duration; 
-      // Trigger preload at 50%
-      const estimatedDelay = (duration * 1000) / 2 / playbackRate;
-      
-      console.log(`Scheduled cache preload for page ${currentPage + 1} in ${estimatedDelay.toFixed(0)}ms`);
-      
-      if (preloadTimeoutRef.current) clearTimeout(preloadTimeoutRef.current);
-      
-      preloadTimeoutRef.current = setTimeout(() => {
-        preloadNextPageAudio(currentPage + 1, doc);
-      }, estimatedDelay);
     }
   };
 
@@ -542,7 +551,7 @@ const App: React.FC = () => {
           mode={readerMode}
           hasText={!!textContent && !isTextScanned}
           isProcessing={isLoading || isGeneratingAI}
-          onUseGeminiTTS={() => handleGeminiTTS()}
+          onUseGeminiTTS={() => handleGeminiTTS(textContent, currentPageNum)}
           onOCR={handleOCR}
           extractedText={textContent}
         />
